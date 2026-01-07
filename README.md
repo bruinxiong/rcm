@@ -1,4 +1,4 @@
-<h1 align="center"> rCM: Score-Regularized Continuous-Time Consistency Model <br>🚀SOTA Diffusion Distillation & Few-Step Video Generation </h1>
+<h1 align="center"> rCM: Score-Regularized Continuous-Time Consistency Model <br>🚀SOTA JVP-Based Diffusion Distillation & Few-Step Video Generation </h1>
 <div align="center">
   <a href='https://arxiv.org/abs/2510.08431'><img src='https://img.shields.io/badge/Paper%20(arXiv)-2510.08431-red?logo=arxiv'></a>  &nbsp;
   <a href='https://research.nvidia.com/labs/dir/rcm'><img src='https://img.shields.io/badge/Website-green?logo=homepage&logoColor=white'></a> &nbsp;
@@ -7,10 +7,10 @@
 ## Overview
 
 rCM is the first work that:
-- Scales up continuous-time consistency distillation (e.g., sCM/MeanFlow) to 10B+ parameter video diffusion models.
-- Provides open-sourced FlashAttention-2 Jacobian-vector product (JVP) kernel with support for parallelisms like FSDP/CP.
-- Identifies the quality bottleneck of sCM and overcomes it via a forward–reverse divergence joint distillation framework.
-- Delivers models that generate videos with both high quality and strong diversity in only 2~4 steps.
+- Scales up **continuous-time consistency distillation (e.g., sCM/MeanFlow)** to 10B+ parameter video diffusion models.
+- Provides open-sourced **FlashAttention-2 Jacobian-vector product (JVP) kernel** with support for parallelisms like FSDP/CP.
+- Identifies the quality bottleneck of sCM and overcomes it via a **forward–reverse divergence joint distillation** framework.
+- Delivers models that generate videos with both **high quality and strong diversity in only 2~4 steps**.
 
 #### Comparison with Other Diffusion Distillation Methods on Wan2.1 T2V 1.3B (4-step)
 
@@ -120,7 +120,7 @@ git clone https://huggingface.co/datasets/worstcoder/Wan_datasets assets/dataset
 Single-node training example:
 
 ```bash
-WORKDIR="/your/path/to/rcm"
+WORKDIR="/path/to/rcm"
 cd $WORKDIR
 export PYTHONPATH=.
 

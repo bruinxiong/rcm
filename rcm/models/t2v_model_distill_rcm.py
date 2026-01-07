@@ -43,18 +43,17 @@ from imaginaire.model import ImaginaireModel
 from imaginaire.utils import log, misc
 from imaginaire.utils.easy_io import easy_io
 from imaginaire.utils.ema import FastEmaModelUpdater
-from imaginaire.callbacks.low_precision import update_master_weights
-from rcm.conditioner import DataType, TextCondition, concat_condition
+from rcm.conditioner import DataType, TextCondition
 from rcm.utils.optim_instantiate_dtensor import get_base_scheduler
 from rcm.utils.lognormal import LogNormal
 from rcm.utils.checkpointer import non_strict_load_model
-from rcm.utils.context_parallel import broadcast, broadcast_split_tensor, cat_outputs_cp
+from rcm.utils.context_parallel import broadcast
 from rcm.utils.dtensor_helper import DTensorFastEmaModelUpdater, broadcast_dtensor_model_states
 from rcm.utils.fsdp_helper import hsdp_device_mesh
 from rcm.utils.jvp_helper import TensorWithT
 from rcm.utils.misc import count_params
 from rcm.utils.torch_future import clip_grad_norm_
-from rcm.modules.denoiser_scaling import RectifiedFlow_TrigFlowWrapper
+from rcm.utils.denoiser_scaling import RectifiedFlow_TrigFlowWrapper
 from rcm.configs.defaults.ema import EMAConfig
 from rcm.samplers.euler import FlowEulerSampler
 from rcm.samplers.unipc import FlowUniPCMultistepSampler
@@ -269,6 +268,19 @@ class T2VDistillModel_rCM(ImaginaireModel):
             self.net_teacher.requires_grad_(False)
             self._param_count = count_params(self.net, verbose=False)
 
+            # Enable/disable CP once; all CP comm/split/gather happens inside net.forward now.
+            cp_group = self.get_context_parallel_group()
+            if cp_group is not None and cp_group.size() > 1:
+                self.net.enable_context_parallel(cp_group)
+                self.net_teacher.enable_context_parallel(cp_group)
+                if self.net_fake_score:
+                    self.net_fake_score.enable_context_parallel(cp_group)
+            else:
+                self.net.disable_context_parallel()
+                self.net_teacher.disable_context_parallel()
+                if self.net_fake_score:
+                    self.net_fake_score.disable_context_parallel()
+
             if config.ema.enabled:
                 self.net_ema = self.build_net(config.net)
                 self.net_ema.requires_grad_(False)
@@ -320,23 +332,7 @@ class T2VDistillModel_rCM(ImaginaireModel):
         update the net_ema
         """
 
-        del scheduler, optimizer
-
-        # the net and its master weights are handled by the low precision callback
-        # manually update the fake score if needed
-        if not self.is_student_phase(iteration):
-            if self.net_fake_score:
-                optimizer = self.optimizer_dict["fake_score"]
-                update_master_weights(optimizer)
-
-        if self.net_fake_score:
-            scheduler, optimizer = self.optimizer_dict["fake_score"], self.scheduler_dict["fake_score"]
-            del scheduler, optimizer
-
-        if not self.is_student_phase(iteration):
-            return
-
-        if self.config.ema.enabled:
+        if self.config.ema.enabled and self.is_student_phase(iteration):
             # calculate beta for EMA update
             ema_beta = self.ema_beta(self.get_effective_iteration(iteration))
             self.net_ema_worker.update_average(self.net, self.net_ema, beta=ema_beta)
@@ -378,25 +374,6 @@ class T2VDistillModel_rCM(ImaginaireModel):
         else:
             return [self.scheduler_dict["fake_score"]]
 
-    def optimizers_zero_grad(self, iteration: int) -> None:
-        """
-        Zero the gradients of the optimizers based on the iteration
-        """
-        for optimizer in self.get_optimizers(iteration):
-            optimizer.zero_grad()
-
-    def optimizers_schedulers_step(self, grad_scaler: torch.cuda.amp.GradScaler, iteration: int) -> None:
-        """
-        Step the optimizer and scheduler step based on the iteration,
-        and gradient scaler is also updated
-        """
-        for optimizer in self.get_optimizers(iteration):
-            grad_scaler.step(optimizer)
-            grad_scaler.update()
-
-        for scheduler in self.get_lr_schedulers(iteration):
-            scheduler.step()
-
     def draw_training_time_G(self, x0_size: int, condition: Any) -> torch.Tensor:
         batch_size = x0_size[0]
         sigma_B = self.p_G(batch_size).to(device="cuda")
@@ -435,7 +412,8 @@ class T2VDistillModel_rCM(ImaginaireModel):
 
         Assumes EDM-scaling parameterization.
 
-        Compared to base class denoise function, this function supports different net types:
+        This function supports different net types:
+        - teacher: the teacher diffusion model
         - fake_score: the fake score net on student generator's outputs
         - student: the student net (few-step generator)
 
@@ -445,8 +423,7 @@ class T2VDistillModel_rCM(ImaginaireModel):
             condition (TextCondition): conditional information, generated from self.conditioner
 
         Returns:
-            DenoisePrediction: The denoised prediction, it includes clean data predicton (x0), \
-                noise prediction (eps_pred).
+            DenoisePrediction: The denoised prediction, it includes clean data predicton (x0) and velocity prediction (F).
         """
         if time.ndim == 1:
             time_B_T = repeat(time, "b -> b 1")
@@ -529,23 +506,40 @@ class T2VDistillModel_rCM(ImaginaireModel):
 
         return (F_pred_B_C_T_H_W, t_F_pred_B_C_T_H_W.detach())
 
-    def training_step_generator(self, x0_B_C_T_H_W: torch.Tensor, condition: TextCondition, uncondition: TextCondition, iteration: int):
-        log.debug(f"Student update {iteration}")
+    def backward_simulation(self, condition, x_B_C_T_H_W_size, n_steps, with_grad: bool = False):
+        G_time_B_1 = math.pi / 2 * torch.ones(x_B_C_T_H_W_size[0], 1, device="cuda")
+        x_B_C_T_H_W = torch.randn(x_B_C_T_H_W_size, device="cuda")
+        x_B_C_T_H_W = self.sync(x_B_C_T_H_W)
+        t_traj, x_traj = [G_time_B_1], [x_B_C_T_H_W]
+        for _ in range(n_steps - 1):
+            G_time_B_1 = torch.minimum(self.draw_training_time_D(x_B_C_T_H_W_size, condition), G_time_B_1)
+            G_time_B_1 = self.sync(G_time_B_1)
+            t_traj.append(G_time_B_1)
+        t_traj.append(0 * G_time_B_1)
+        for step, (t_cur_B_1, t_next_B_1) in enumerate(zip(t_traj[:-1], t_traj[1:])):
+            context_fn = torch.enable_grad if with_grad and step == n_steps - 1 else torch.no_grad
+            with context_fn():
+                x_B_C_T_H_W = self.denoise(x_B_C_T_H_W, t_cur_B_1, condition, net_type="student").x0.float()
+            if step < n_steps - 1:
+                x_B_C_T_H_W = math.cos(rearrange(t_next_B_1, "b t -> b 1 t 1 1")) * x_B_C_T_H_W + math.sin(
+                    rearrange(t_next_B_1, "b t -> b 1 t 1 1")
+                ) * self.sync(torch.randn_like(x_B_C_T_H_W))
+            x_traj.append(x_B_C_T_H_W.detach())
+        return x_B_C_T_H_W, (t_traj, x_traj)
+
+    def _make_student_ctx(self, x0_B_C_T_H_W, condition, uncondition, iteration):
+        x0_B_C_T_H_W, condition, uncondition = self.sync(x0_B_C_T_H_W, condition, uncondition)
+        return (x0_B_C_T_H_W, condition, uncondition)
+
+    def _student_scm_step(self, ctx, iteration):
+        log.debug(f"Student update {iteration} (sCM)")
+        x0_B_C_T_H_W, condition, uncondition = ctx
         time_B_T = self.draw_training_time_G(x0_B_C_T_H_W.size(), condition)
         epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), device="cuda")
-
-        # Broadcast and split the input data and condition for model parallelism
-        (
-            x0_B_C_T_H_W,
-            condition,
-            uncondition,
-            epsilon_B_C_T_H_W,
-            time_B_T,
-        ) = self.broadcast_split_for_model_parallelsim(x0_B_C_T_H_W, condition, uncondition, epsilon_B_C_T_H_W, time_B_T)
+        time_B_T, epsilon_B_C_T_H_W = self.sync(time_B_T, epsilon_B_C_T_H_W)
 
         time_B_1_T_1_1 = rearrange(time_B_T, "b t -> b 1 t 1 1")
         cost_B_1_T_1_1, sint_B_1_T_1_1 = torch.cos(time_B_1_T_1_1), torch.sin(time_B_1_T_1_1)
-        # Generate noisy observations
         xt_B_C_T_H_W = x0_B_C_T_H_W * cost_B_1_T_1_1 + epsilon_B_C_T_H_W * sint_B_1_T_1_1
         with torch.no_grad():
             F_teacher_B_C_T_H_W = self.denoise(xt_B_C_T_H_W, time_B_T, condition, net_type="teacher").F
@@ -574,28 +568,7 @@ class T2VDistillModel_rCM(ImaginaireModel):
             else:
                 _, t_F_theta_B_C_T_H_W = self.student_F_withT((xt_B_C_T_H_W, t_xt_B_C_T_H_W), (time_B_T, t_time_B_T), condition)
 
-        if self.net_fake_score and iteration > self.tangent_warmup:
-            G_time_B_T = math.pi / 2 * torch.ones_like(time_B_T)
-            G_time_B_1_T_1_1 = rearrange(G_time_B_T, "b t -> b 1 t 1 1")
-            G_cost_B_1_T_1_1, G_sint_B_1_T_1_1 = torch.cos(G_time_B_1_T_1_1), torch.sin(G_time_B_1_T_1_1)
-            G_xt_B_C_T_H_W = x0_B_C_T_H_W * G_cost_B_1_T_1_1 + torch.randn_like(epsilon_B_C_T_H_W) * G_sint_B_1_T_1_1
-            num_simulation_steps_fake = self.get_effective_iteration(iteration) % self.max_simulation_steps_fake
-            for _ in range(num_simulation_steps_fake):
-                with torch.no_grad():
-                    G_x0_B_C_T_H_W = self.denoise(G_xt_B_C_T_H_W, G_time_B_T, condition, net_type="student").x0
-                G_time_B_T = torch.minimum(self.draw_training_time_D(x0_B_C_T_H_W.size(), condition), G_time_B_T)
-                G_time_B_T = self.sync(G_time_B_T, condition)
-                G_time_B_1_T_1_1 = rearrange(G_time_B_T, "b t -> b 1 t 1 1")
-                G_cost_B_1_T_1_1, G_sint_B_1_T_1_1 = torch.cos(G_time_B_1_T_1_1), torch.sin(G_time_B_1_T_1_1)
-                G_xt_B_C_T_H_W = G_x0_B_C_T_H_W * G_cost_B_1_T_1_1 + torch.randn_like(epsilon_B_C_T_H_W) * G_sint_B_1_T_1_1
-            all_xt_B_C_T_H_W = torch.cat([xt_B_C_T_H_W, G_xt_B_C_T_H_W], dim=0)
-            all_time_B_T = torch.cat([time_B_T, G_time_B_T], dim=0)
-            all_condition = concat_condition(condition, condition)
-            all_theta_B_C_T_H_W = self.denoise(all_xt_B_C_T_H_W, all_time_B_T, all_condition, net_type="student")
-            F_theta_B_C_T_H_W, _ = torch.chunk(all_theta_B_C_T_H_W.F, 2)
-            _, G_x0_theta_B_C_T_H_W = torch.chunk(all_theta_B_C_T_H_W.x0, 2)
-        else:
-            F_theta_B_C_T_H_W = self.denoise(xt_B_C_T_H_W, time_B_T, condition, net_type="student").F
+        F_theta_B_C_T_H_W = self.denoise(xt_B_C_T_H_W, time_B_T, condition, net_type="student").F
         F_theta_B_C_T_H_W_sg = F_theta_B_C_T_H_W.clone().detach()
 
         warmup_ratio = min(1.0, iteration / self.tangent_warmup)
@@ -629,154 +602,114 @@ class T2VDistillModel_rCM(ImaginaireModel):
         x0_teacher_B_C_T_H_W = cost_B_1_T_1_1 * xt_B_C_T_H_W - sint_B_1_T_1_1 * F_teacher_B_C_T_H_W
         x0_theta_B_C_T_H_W = cost_B_1_T_1_1 * xt_B_C_T_H_W - sint_B_1_T_1_1 * F_theta_B_C_T_H_W
         output_batch = {
-            "x0": x0_B_C_T_H_W,
-            "xt": xt_B_C_T_H_W,
-            "time": time_B_T,
+            "x0": x0_B_C_T_H_W.detach().cpu(),
+            "xt": xt_B_C_T_H_W.detach().cpu(),
+            "time": time_B_T.detach().cpu(),
             "condition": condition,
-            "df_dt": df_dt,
-            "nan_mask_g": nan_mask_g,
-            "nan_mask_F_theta": nan_mask_F_theta,
-            "teacher_pred": DenoisePrediction(x0_teacher_B_C_T_H_W, F_teacher_B_C_T_H_W),
-            "model_pred": DenoisePrediction(x0_theta_B_C_T_H_W, F_theta_B_C_T_H_W),
+            "df_dt": df_dt.detach().cpu(),
+            "nan_mask_g": nan_mask_g.detach().cpu(),
+            "nan_mask_F_theta": nan_mask_F_theta.detach().cpu(),
+            "teacher_pred": DenoisePrediction(x0_teacher_B_C_T_H_W.detach().cpu(), F_teacher_B_C_T_H_W.detach().cpu()),
+            "model_pred": DenoisePrediction(x0_theta_B_C_T_H_W.detach().cpu(), F_theta_B_C_T_H_W.detach().cpu()),
         }
+        return output_batch, kendall_loss
 
-        if self.net_fake_score and iteration > self.tangent_warmup:
-            D_time_B_T = self.draw_training_time_D(x0_B_C_T_H_W.size(), condition)
-            D_time_B_T = self.sync(D_time_B_T, condition)
-            D_time_B_1_T_1_1 = rearrange(D_time_B_T, "b t -> b 1 t 1 1")
-            D_xt_theta_B_C_T_H_W = G_x0_theta_B_C_T_H_W * torch.cos(D_time_B_1_T_1_1) + torch.randn_like(x0_B_C_T_H_W) * torch.sin(D_time_B_1_T_1_1)
+    def _student_dmd_step(self, ctx, iteration):
+        log.debug(f"Student update {iteration} (DMD)")
+        x0_B_C_T_H_W, condition, uncondition = ctx
+        num_simulation_steps_fake = self.get_effective_iteration(iteration) % self.max_simulation_steps_fake + 1
+        G_x0_theta_B_C_T_H_W, _ = self.backward_simulation(condition, x0_B_C_T_H_W.size(), num_simulation_steps_fake, with_grad=True)
+        D_time_B_T = self.draw_training_time_D(x0_B_C_T_H_W.size(), condition)
+        epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), device="cuda")
+        D_time_B_T, epsilon_B_C_T_H_W = self.sync(D_time_B_T, epsilon_B_C_T_H_W)
+        D_time_B_1_T_1_1 = rearrange(D_time_B_T, "b t -> b 1 t 1 1")
+        D_xt_theta_B_C_T_H_W = torch.cos(D_time_B_1_T_1_1) * G_x0_theta_B_C_T_H_W + torch.sin(D_time_B_1_T_1_1) * epsilon_B_C_T_H_W
 
-            with torch.no_grad():
-                x0_theta_fake_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="fake_score").x0
-
-            with torch.no_grad():
-                x0_theta_teacher_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="teacher").x0
-                if self.teacher_guidance > 0.0:
-                    x0_theta_teacher_B_C_T_H_W_uncond = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, uncondition, net_type="teacher").x0
-                    x0_theta_teacher_B_C_T_H_W = x0_theta_teacher_B_C_T_H_W + self.teacher_guidance * (
-                        x0_theta_teacher_B_C_T_H_W - x0_theta_teacher_B_C_T_H_W_uncond
-                    )
-            with torch.no_grad():
-                weight_factor = (
-                    torch.abs(G_x0_theta_B_C_T_H_W.double() - x0_theta_teacher_B_C_T_H_W.double())
-                    .mean(dim=[1, 2, 3, 4], keepdim=True)
-                    .clip(min=0.00001)
+        with torch.no_grad():
+            x0_theta_fake_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="fake_score").x0
+        with torch.no_grad():
+            x0_theta_teacher_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="teacher").x0
+            if self.teacher_guidance > 0.0:
+                x0_theta_teacher_B_C_T_H_W_uncond = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, uncondition, net_type="teacher").x0
+                x0_theta_teacher_B_C_T_H_W = x0_theta_teacher_B_C_T_H_W + self.teacher_guidance * (
+                    x0_theta_teacher_B_C_T_H_W - x0_theta_teacher_B_C_T_H_W_uncond
                 )
-            grad_B_C_T_H_W = (x0_theta_fake_B_C_T_H_W.double() - x0_theta_teacher_B_C_T_H_W.double()) / weight_factor
-            loss_dmd = (G_x0_theta_B_C_T_H_W.double() - (G_x0_theta_B_C_T_H_W.double() - grad_B_C_T_H_W).detach()) ** 2
-            loss_dmd[torch.isnan(loss_dmd).flatten(start_dim=1).any(dim=1)] = 0
-            loss_dmd = loss_dmd.sum(dim=(1, 2, 3, 4))
-            kendall_loss += self.loss_scale_dmd * loss_dmd
+        with torch.no_grad():
+            weight_factor = (
+                torch.abs(G_x0_theta_B_C_T_H_W.double() - x0_theta_teacher_B_C_T_H_W.double()).mean(dim=[1, 2, 3, 4], keepdim=True).clip(min=0.00001)
+            )
+        grad_B_C_T_H_W = (x0_theta_fake_B_C_T_H_W.double() - x0_theta_teacher_B_C_T_H_W.double()) / weight_factor
+        loss_dmd = (G_x0_theta_B_C_T_H_W.double() - (G_x0_theta_B_C_T_H_W.double() - grad_B_C_T_H_W).detach()) ** 2
+        loss_dmd[torch.isnan(loss_dmd).flatten(start_dim=1).any(dim=1)] = 0
+        loss_dmd = loss_dmd.sum(dim=(1, 2, 3, 4))
+        kendall_loss = self.loss_scale_dmd * loss_dmd
+        output_batch = {
+            "G_x0": G_x0_theta_B_C_T_H_W.detach().cpu(),
+            "D_xt": D_xt_theta_B_C_T_H_W.detach().cpu(),
+            "D_time": D_time_B_T.detach().cpu(),
+            "x0_theta_fake": x0_theta_fake_B_C_T_H_W.detach().cpu(),
+            "x0_theta_teacher": x0_theta_teacher_B_C_T_H_W.detach().cpu(),
+        }
         return output_batch, kendall_loss
 
     def training_step_critic(
         self, x0_B_C_T_H_W: torch.Tensor, condition: TextCondition, uncondition: TextCondition, iteration: int
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         log.debug(f"Critic update {iteration}")
-        # Sample pertubation noise levels and N(0, 1) noises
         time_B_T = self.draw_training_time_G(x0_B_C_T_H_W.size(), condition)
         epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), device="cuda")
-
-        # Broadcast and split the input data and condition for model parallelism
-        (
-            x0_B_C_T_H_W,
-            condition,
-            uncondition,
-            epsilon_B_C_T_H_W,
-            time_B_T,
-        ) = self.broadcast_split_for_model_parallelsim(x0_B_C_T_H_W, condition, uncondition, epsilon_B_C_T_H_W, time_B_T)
-        G_time_B_T = math.pi / 2 * torch.ones_like(time_B_T)
-        G_time_B_1_T_1_1 = rearrange(G_time_B_T, "b t -> b 1 t 1 1")
-        G_cost_B_1_T_1_1, G_sint_B_1_T_1_1 = torch.cos(G_time_B_1_T_1_1), torch.sin(G_time_B_1_T_1_1)
-        G_xt_B_C_T_H_W = x0_B_C_T_H_W * G_cost_B_1_T_1_1 + epsilon_B_C_T_H_W * G_sint_B_1_T_1_1
-
-        num_simulation_steps_fake = self.get_effective_iteration_fake(iteration) % self.max_simulation_steps_fake
-        for _ in range(num_simulation_steps_fake):
-            with torch.no_grad():
-                G_x0_B_C_T_H_W = self.denoise(G_xt_B_C_T_H_W, G_time_B_T, condition, net_type="student").x0
-            G_time_B_T = torch.minimum(self.draw_training_time_D(x0_B_C_T_H_W.size(), condition), G_time_B_T)
-            G_time_B_T = self.sync(G_time_B_T, condition)
-            G_time_B_1_T_1_1 = rearrange(G_time_B_T, "b t -> b 1 t 1 1")
-            G_cost_B_1_T_1_1, G_sint_B_1_T_1_1 = torch.cos(G_time_B_1_T_1_1), torch.sin(G_time_B_1_T_1_1)
-            G_xt_B_C_T_H_W = G_x0_B_C_T_H_W * G_cost_B_1_T_1_1 + torch.randn_like(epsilon_B_C_T_H_W) * G_sint_B_1_T_1_1
-
-        with torch.no_grad():
-            G_x0_theta_B_C_T_H_W = self.denoise(G_xt_B_C_T_H_W, G_time_B_T, condition, net_type="student").x0
+        x0_B_C_T_H_W, time_B_T, epsilon_B_C_T_H_W, condition, uncondition = self.sync(
+            x0_B_C_T_H_W, time_B_T, epsilon_B_C_T_H_W, condition, uncondition
+        )
+        num_simulation_steps_fake = self.get_effective_iteration_fake(iteration) % self.max_simulation_steps_fake + 1
+        G_x0_theta_B_C_T_H_W, _ = self.backward_simulation(condition, x0_B_C_T_H_W.size(), num_simulation_steps_fake, with_grad=False)
 
         D_time_B_T = self.draw_training_time_D(x0_B_C_T_H_W.size(), condition)
-        D_epsilon_B_C_T_H_W = torch.randn_like(x0_B_C_T_H_W)
-        D_time_B_T = self.sync(D_time_B_T, condition)
+        D_epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), device="cuda")
+        D_time_B_T, D_epsilon_B_C_T_H_W = self.sync(D_time_B_T, D_epsilon_B_C_T_H_W)
         D_time_B_1_T_1_1 = rearrange(D_time_B_T, "b t -> b 1 t 1 1")
         D_cost_B_1_T_1_1, D_sint_B_1_T_1_1 = torch.cos(D_time_B_1_T_1_1), torch.sin(D_time_B_1_T_1_1)
-        D_xt_theta_B_C_T_H_W = G_x0_theta_B_C_T_H_W * D_cost_B_1_T_1_1 + D_epsilon_B_C_T_H_W * D_sint_B_1_T_1_1
+        D_xt_theta_B_C_T_H_W = D_cost_B_1_T_1_1 * G_x0_theta_B_C_T_H_W + D_sint_B_1_T_1_1 * D_epsilon_B_C_T_H_W
         x0_theta_fake_B_C_T_H_W = self.denoise(D_xt_theta_B_C_T_H_W, D_time_B_T, condition, net_type="fake_score").x0
         kendall_loss = self.loss_scale_fake_score * ((G_x0_theta_B_C_T_H_W - x0_theta_fake_B_C_T_H_W) ** 2 / D_sint_B_1_T_1_1**2).sum(
             dim=(1, 2, 3, 4)
         )
         output_batch = {
-            "x0": x0_B_C_T_H_W,
-            "xt": G_xt_B_C_T_H_W,
-            "x0_pred": G_x0_theta_B_C_T_H_W,
+            "G_x0": G_x0_theta_B_C_T_H_W.detach().cpu(),
+            "D_xt": D_xt_theta_B_C_T_H_W.detach().cpu(),
+            "D_time": D_time_B_T.detach().cpu(),
+            "x0_theta_fake": x0_theta_fake_B_C_T_H_W.detach().cpu(),
         }
         return output_batch, kendall_loss
 
-    def training_step(self, data_batch: dict[str, torch.Tensor], iteration: int) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        # Get the input data to noise and denoise~(image, video) and the corresponding conditioner.
+    def training_step_closures(self, data_batch, iteration: int):
         _, x0_B_C_T_H_W, condition, uncondition = self.get_data_and_condition(data_batch)
 
         if self.is_student_phase(iteration):
-            # update the student
             self.net.train().requires_grad_(True)
             if self.net_fake_score:
                 self.net_fake_score.eval().requires_grad_(False)
 
-            output_batch, kendall_loss = self.training_step_generator(x0_B_C_T_H_W, condition, uncondition, iteration)
+            ctx = self._make_student_ctx(x0_B_C_T_H_W, condition, uncondition, iteration)
+
+            if self.loss_scale > 0:
+                yield "scm", lambda: self._student_scm_step(ctx, iteration)
+
+            if self.net_fake_score and iteration > self.tangent_warmup and self.loss_scale_dmd > 0:
+                yield "dmd", lambda: self._student_dmd_step(ctx, iteration)
 
         else:
-            # update the fake_score
             self.net.eval().requires_grad_(False)
             if self.net_fake_score:
                 self.net_fake_score.train().requires_grad_(True)
 
-            output_batch, kendall_loss = self.training_step_critic(x0_B_C_T_H_W, condition, uncondition, iteration)
-
-        kendall_loss = kendall_loss.mean()
-
-        return output_batch, kendall_loss
+            yield "critic", lambda: self.training_step_critic(x0_B_C_T_H_W, condition, uncondition, iteration)
 
     @torch.no_grad()
     def forward(self, xt, t, condition: TextCondition):
-        """
-        Performs denoising on the input noise data, noise level, and condition
-
-        Args:
-            xt (torch.Tensor): The input noise data.
-            sigma (torch.Tensor): The noise level.
-            condition (TextCondition): conditional information, generated from self.conditioner
-
-        Returns:
-            DenoisePrediction: The denoised prediction, it includes clean data predicton (x0), \
-                noise prediction (eps_pred).
-        """
-        return self.denoise(xt, t, condition)
+        pass
 
     # ------------------------ Sampling ------------------------
-
-    def get_x0_fn_from_batch(self, data_batch: Dict) -> Callable:
-
-        _, _, condition, uncondition = self.get_data_and_condition(data_batch)
-        _, condition, uncondition, _, _ = self.broadcast_split_for_model_parallelsim(None, condition, uncondition, None, None)
-
-        # For inference, check if parallel_state is initialized
-        if not parallel_state.is_initialized():
-            assert not self.net.is_context_parallel_enabled, "parallel_state is not initialized, context parallel should be turned off."
-
-        @torch.no_grad()
-        def x0_fn(noise_x: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
-            raw_x0 = self.denoise(noise_x, time, condition, net_type="student").x0
-            return raw_x0
-
-        return x0_fn
 
     @torch.no_grad()
     def generate_samples_from_batch(
@@ -802,7 +735,7 @@ class T2VDistillModel_rCM(ImaginaireModel):
                 _W // self.tokenizer.spatial_compression_factor,
             ]
 
-        x0_fn = self.get_x0_fn_from_batch(data_batch)
+        _, _, condition, uncondition = self.get_data_and_condition(data_batch)
 
         generator = torch.Generator(device=self.tensor_kwargs["device"])
         generator.manual_seed(seed)
@@ -815,9 +748,7 @@ class T2VDistillModel_rCM(ImaginaireModel):
                 device=self.tensor_kwargs["device"],
                 generator=generator,
             )
-
-        if self.net.is_context_parallel_enabled:
-            init_noise = broadcast_split_tensor(init_noise, seq_dim=2, process_group=self.get_context_parallel_group())
+        init_noise, condition = self.sync(init_noise, condition)
 
         if mid_t is None:
             mid_t = [1.3, 1.0, 0.6][: num_steps - 1]
@@ -835,20 +766,16 @@ class T2VDistillModel_rCM(ImaginaireModel):
         x = init_noise.to(torch.float64)
         ones = torch.ones(x.size(0), device=x.device, dtype=x.dtype)
         for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
-            x = x0_fn(x.float(), t_cur.float() * ones).to(torch.float64)
-            noise = torch.randn(
+            x = self.denoise(x.float(), t_cur.float() * ones, condition, net_type="student").x0.to(torch.float64)
+            x = torch.cos(t_next) * x + torch.sin(t_next) * torch.randn(
                 n_sample,
                 *state_shape,
                 dtype=torch.float32,
                 device=self.tensor_kwargs["device"],
                 generator=generator,
             )
-            if self.net.is_context_parallel_enabled:
-                noise = broadcast_split_tensor(noise, seq_dim=2, process_group=self.get_context_parallel_group())
-            x = torch.cos(t_next) * x + torch.sin(t_next) * noise
+            x = self.sync(x)
         samples = x.float()
-        if self.net.is_context_parallel_enabled:
-            samples = cat_outputs_cp(samples, seq_dim=2, cp_group=self.get_context_parallel_group())
         return torch.nan_to_num(samples)
 
     @torch.no_grad()
@@ -875,7 +802,6 @@ class T2VDistillModel_rCM(ImaginaireModel):
             num_steps (int): number of steps for the diffusion process
         """
         _, _, condition, uncondition = self.get_data_and_condition(data_batch)
-        _, condition, uncondition, _, _ = self.broadcast_split_for_model_parallelsim(None, condition, uncondition, None, None)
 
         input_key = self.input_data_key
 
@@ -901,9 +827,7 @@ class T2VDistillModel_rCM(ImaginaireModel):
                 device=self.tensor_kwargs["device"],
                 generator=generator,
             )
-
-        if self.net_teacher.is_context_parallel_enabled:
-            init_noise = broadcast_split_tensor(init_noise, seq_dim=2, process_group=self.get_context_parallel_group())
+        init_noise, condition, uncondition = self.sync(init_noise, condition, uncondition)
 
         x = init_noise.to(torch.float64)
 
@@ -931,8 +855,6 @@ class T2VDistillModel_rCM(ImaginaireModel):
             x = sampler.step(v_pred, t, x)
 
         samples = x.float()
-        if self.net_teacher.is_context_parallel_enabled:
-            samples = cat_outputs_cp(samples, seq_dim=2, cp_group=self.get_context_parallel_group())
 
         return torch.nan_to_num(samples)
 
@@ -951,44 +873,14 @@ class T2VDistillModel_rCM(ImaginaireModel):
             return parallel_state.get_context_parallel_group()
         return None
 
-    def sync(self, tensor, condition):
+    def sync(self, *args):
         cp_group = self.get_context_parallel_group()
         cp_size = 1 if cp_group is None else cp_group.size()
-        if condition.is_video and cp_size > 1:
-            tensor = broadcast(tensor, cp_group)
-        return tensor
-
-    def broadcast_split_for_model_parallelsim(self, x0_B_C_T_H_W, condition, uncondition, epsilon_B_C_T_H_W, sigma_B_T):
-        """
-        Broadcast and split the input data and condition for model parallelism.
-        Currently, we only support context parallelism.
-        """
-        cp_group = self.get_context_parallel_group()
-        cp_size = 1 if cp_group is None else cp_group.size()
-        if condition.is_video and cp_size > 1:
-            x0_B_C_T_H_W = broadcast_split_tensor(x0_B_C_T_H_W, seq_dim=2, process_group=cp_group)
-            epsilon_B_C_T_H_W = broadcast_split_tensor(epsilon_B_C_T_H_W, seq_dim=2, process_group=cp_group)
-            if sigma_B_T is not None:
-                assert sigma_B_T.ndim == 2, "sigma_B_T should be 2D tensor"
-                if sigma_B_T.shape[-1] == 1:
-                    sigma_B_T = broadcast(sigma_B_T, cp_group)
-                else:
-                    sigma_B_T = broadcast_split_tensor(sigma_B_T, seq_dim=1, process_group=cp_group)
-            condition = condition.broadcast(cp_group)
-            uncondition = uncondition.broadcast(cp_group)
-            self.net.enable_context_parallel(cp_group)
-            if self.net_teacher:
-                self.net_teacher.enable_context_parallel(cp_group)
-            if self.net_fake_score:
-                self.net_fake_score.enable_context_parallel(cp_group)
+        if cp_size > 1:
+            out = tuple(broadcast(arg, cp_group) if isinstance(arg, torch.Tensor) else arg.broadcast(cp_group) for arg in args)
         else:
-            self.net.disable_context_parallel()
-            if self.net_teacher:
-                self.net_teacher.disable_context_parallel()
-            if self.net_fake_score:
-                self.net_fake_score.disable_context_parallel()
-
-        return x0_B_C_T_H_W, condition, uncondition, epsilon_B_C_T_H_W, sigma_B_T
+            out = args
+        return out[0] if len(out) == 1 else out
 
     # ------------------ Data Preprocessing ------------------
 
@@ -1203,13 +1095,19 @@ class T2VDistillModel_rCM(ImaginaireModel):
         norm_type: float = 2.0,
         error_if_nonfinite: bool = False,
         foreach: Optional[bool] = None,
+        iteration: int = 0,
     ):
         if not self.grad_clip:
             max_norm = 1e12
+        if self.is_student_phase(iteration):
+            return clip_grad_norm_(
+                self.net.parameters(),
+                max_norm=max_norm,
+                norm_type=norm_type,
+                error_if_nonfinite=error_if_nonfinite,
+                foreach=foreach,
+            ).cpu()
         if self.net_fake_score:
-            for param in self.net_fake_score.parameters():
-                if param.grad is not None:
-                    torch.nan_to_num(param.grad, nan=0, posinf=0, neginf=0, out=param.grad)
             clip_grad_norm_(
                 self.net_fake_score.parameters(),
                 max_norm=max_norm,
@@ -1217,13 +1115,4 @@ class T2VDistillModel_rCM(ImaginaireModel):
                 error_if_nonfinite=error_if_nonfinite,
                 foreach=foreach,
             )
-        for param in self.net.parameters():
-            if param.grad is not None:
-                torch.nan_to_num(param.grad, nan=0, posinf=0, neginf=0, out=param.grad)
-        return clip_grad_norm_(
-            self.net.parameters(),
-            max_norm=max_norm,
-            norm_type=norm_type,
-            error_if_nonfinite=error_if_nonfinite,
-            foreach=foreach,
-        ).cpu()
+        return None
